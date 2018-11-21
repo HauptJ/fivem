@@ -841,6 +841,8 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		OverloadCrashData(&taskDialogConfig);
 
+		trace("Process crash captured. Crash dialog content:\n%s\n%s\n", ToNarrow(taskDialogConfig.pszMainInstruction), ToNarrow(taskDialogConfig.pszContent));
+
 		auto thread = std::thread([=]()
 		{
 			TaskDialogIndirect(&taskDialogConfig, nullptr, nullptr, nullptr);
@@ -861,6 +863,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		if (uploadCrashes && HTTPUpload::SendRequest(L"http://updater.fivereborn.com:1127/post", parameters, files, nullptr, &responseBody, &responseCode))
 #endif
 		{
+			trace("Crash report service returned %s\n", ToNarrow(responseBody));
 			crashId = responseBody;
 		}
 		else
@@ -895,6 +898,28 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 	}
 
 	NVSP_ShutdownSafely();
+}
+
+namespace google_breakpad
+{
+	class AutoExceptionHandler
+	{
+	public:
+		static LONG HandleException(EXCEPTION_POINTERS* exinfo)
+		{
+			return ExceptionHandler::HandleException(exinfo);
+		}
+	};
+}
+
+void InitializeMiniDumpOverride()
+{
+	auto CoreSetExceptionOverride = (void(*)(LONG(*)(EXCEPTION_POINTERS*)))GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreSetExceptionOverride");
+
+	if (CoreSetExceptionOverride)
+	{
+		CoreSetExceptionOverride(AutoExceptionHandler::HandleException);
+	}
 }
 
 bool InitializeExceptionHandler()

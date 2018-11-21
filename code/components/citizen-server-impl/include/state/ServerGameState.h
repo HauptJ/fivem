@@ -12,6 +12,8 @@
 
 #include <bitset>
 
+#include <tbb/concurrent_unordered_map.h>
+
 namespace fx
 {
 struct ScriptGuid;
@@ -25,6 +27,7 @@ struct SyncParseState
 {
 	rl::MessageBuffer buffer;
 	int syncType;
+	int objType;
 
 	std::shared_ptr<SyncEntityState> entity;
 
@@ -35,6 +38,7 @@ struct SyncUnparseState
 {
 	rl::MessageBuffer buffer;
 	int syncType;
+	int objType;
 
 	std::shared_ptr<Client> client;
 };
@@ -89,10 +93,11 @@ struct SyncEntityState
 {
 	using TData = std::variant<int, float, bool, std::string>;
 
-	std::unordered_map<std::string, TData> data;
+	tbb::concurrent_unordered_map<std::string, TData> data;
 	std::weak_ptr<fx::Client> client;
 	NetObjEntityType type;
 	std::bitset<256> ackedCreation;
+	std::bitset<256> didDeletion;
 	uint32_t timestamp;
 	uint64_t frameIndex;
 
@@ -178,6 +183,10 @@ public:
 
 	void SendObjectIds(const std::shared_ptr<fx::Client>& client, int numIds);
 
+	void RemoveEntity(uint32_t entityHandle);
+
+	void ReassignEntity(uint32_t entityHandle, const std::shared_ptr<fx::Client>& targetClient);
+
 private:
 	void ProcessCloneCreate(const std::shared_ptr<fx::Client>& client, rl::MessageBuffer& inPacket, net::Buffer& ackPacket);
 
@@ -197,6 +206,9 @@ public:
 
 private:
 	fx::ServerInstanceBase* m_instance;
+
+	// as bitset is not thread-safe
+	std::mutex m_objectIdsMutex;
 
 	std::bitset<8192> m_objectIdsSent;
 	std::bitset<8192> m_objectIdsUsed;
@@ -228,7 +240,7 @@ private:
 
 //private:
 public:
-	std::unordered_map<uint32_t, std::shared_ptr<sync::SyncEntityState>> m_entities;
+	tbb::concurrent_unordered_map<uint32_t, std::shared_ptr<sync::SyncEntityState>> m_entities;
 };
 
 std::unique_ptr<sync::SyncTreeBase> MakeSyncTree(sync::NetObjEntityType objectType);

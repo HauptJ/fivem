@@ -18,6 +18,8 @@
 
 #include <PrintListener.h>
 
+#include <ResourceStreamComponent.h>
+
 class LocalResourceMounter : public fx::ResourceMounter
 {
 public:
@@ -508,6 +510,32 @@ static InitFunction initFunction2([]()
 		context.SetResult(success);
 	});
 
+	fx::ScriptEngine::RegisterNativeHandler("REGISTER_RESOURCE_ASSET", [](fx::ScriptContext& context)
+	{
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
+
+		if (!resource.GetRef())
+		{
+			throw std::runtime_error("Invalid resource name passed to REGISTER_RESOURCE_ASSET.");
+		}
+
+		auto diskName = context.CheckArgument<const char*>(1);
+
+		auto streamComponent = resource->GetComponent<fx::ResourceStreamComponent>();
+		auto sf = streamComponent->AddStreamingFile(resource->GetPath() + "/" + diskName);
+
+		if (!sf)
+		{
+			throw std::runtime_error("Failed to register streaming file in REGISTER_RESOURCE_ASSET.");
+		}
+
+		static std::string tempStr;
+		tempStr = sf->GetCacheString();
+		
+		context.SetResult<const char*>(tempStr.c_str());
+	});
+
 	fx::ScriptEngine::RegisterNativeHandler("SET_GAME_TYPE", [](fx::ScriptContext& context)
 	{
 		// get the current resource manager
@@ -631,5 +659,39 @@ static InitFunction initFunction2([]()
 
 		// set variable
 		consoleContext->ExecuteSingleCommandDirect(ProgramArguments{ "set", context.CheckArgument<const char*>(0), context.CheckArgument<const char*>(1) });
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_CONVAR_SERVER_INFO", [](fx::ScriptContext& context)
+	{
+		// get the current resource manager
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+
+		// get the owning server instance
+		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
+
+		// get the server's console context
+		auto consoleContext = instance->GetComponent<console::Context>();
+
+		se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
+
+		// set variable
+		consoleContext->ExecuteSingleCommandDirect(ProgramArguments{ "sets", context.CheckArgument<const char*>(0), context.CheckArgument<const char*>(1) });
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_CONVAR_REPLICATED", [](fx::ScriptContext& context)
+	{
+		// get the current resource manager
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+
+		// get the owning server instance
+		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
+
+		// get the server's console context
+		auto consoleContext = instance->GetComponent<console::Context>();
+
+		se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
+
+		// set variable
+		consoleContext->ExecuteSingleCommandDirect(ProgramArguments{ "setr", context.CheckArgument<const char*>(0), context.CheckArgument<const char*>(1) });
 	});
 });

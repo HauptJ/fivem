@@ -19,6 +19,8 @@
 #include <NetLibrary.h>
 #include <NetBuffer.h>
 
+#include <EntitySystem.h>
+
 extern NetLibrary* g_netLibrary;
 
 class CNetGamePlayer;
@@ -55,9 +57,9 @@ static rage::netPlayerMgrBase* g_playerMgr = (rage::netPlayerMgrBase*)0x1427D232
 
 void* g_tempRemotePlayer;
 
-static CNetGamePlayer* g_players[256];
-static std::unordered_map<uint16_t, CNetGamePlayer*> g_playersByNetId;
-static std::unordered_map<CNetGamePlayer*, uint16_t> g_netIdsByPlayer;
+CNetGamePlayer* g_players[256];
+std::unordered_map<uint16_t, CNetGamePlayer*> g_playersByNetId;
+std::unordered_map<CNetGamePlayer*, uint16_t> g_netIdsByPlayer;
 
 static CNetGamePlayer* g_playerList[256];
 static int g_playerListCount;
@@ -167,22 +169,6 @@ static bool IsNetworkPlayerConnected(int index)
 
 //int g_physIdx = 1;
 int g_physIdx = 42;
-
-struct ScInAddr
-{
-	uint64_t unkKey1;
-	uint64_t unkKey2;
-	uint32_t secKeyTime; // added in 393
-	uint32_t ipLan;
-	uint16_t portLan;
-	uint32_t ipUnk;
-	uint16_t portUnk;
-	uint32_t ipOnline;
-	uint16_t portOnline;
-	uint16_t pad3;
-	uint32_t newVal; // added in 372
-	uint64_t rockstarAccountId; // 463/505
-};
 
 namespace sync
 {
@@ -300,7 +286,7 @@ void HandleCliehtDrop(const NetLibraryClientInfo& info)
 
 static CNetGamePlayer*(*g_origGetOwnerNetPlayer)(rage::netObject*);
 
-static CNetGamePlayer* netObject__GetOwnerNetPlayer(rage::netObject* object)
+static CNetGamePlayer* netObject__GetPlayerOwner(rage::netObject* object)
 {
 	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 	{
@@ -312,13 +298,35 @@ static CNetGamePlayer* netObject__GetOwnerNetPlayer(rage::netObject* object)
 		auto player = g_playersByNetId[TheClones->GetClientId(object)];
 
 		// FIXME: figure out why bad playerinfos occur
-		if (player->playerInfo != nullptr)
+		if (player != nullptr && player->playerInfo != nullptr)
 		{
 			return player;
 		}
 	}
 
 	return g_playerMgr->localPlayer;
+}
+
+static CNetGamePlayer*(*g_origGetPendingPlayerOwner)(rage::netObject*);
+
+static CNetGamePlayer* netObject__GetPendingPlayerOwner(rage::netObject* object)
+{
+	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		return g_origGetPendingPlayerOwner(object);
+	}
+
+	if (object->syncData.nextOwnerId != 0xFF)
+	{
+		auto player = g_playersByNetId[TheClones->GetPendingClientId(object)];
+
+		if (player != nullptr && player->playerInfo != nullptr)
+		{
+			return player;
+		}
+	}
+
+	return nullptr;
 }
 
 static hook::cdecl_stub<void*(int handle)> getScriptEntity([]()
@@ -431,16 +439,45 @@ static void PassObjectControlStub(CNetGamePlayer* player, rage::netObject* netOb
 		return g_origPassObjectControl(player, netObject, a3);
 	}
 
-	if (player->physicalPlayerIndex == netObject__GetOwnerNetPlayer(netObject)->physicalPlayerIndex)
+	if (player->physicalPlayerIndex == netObject__GetPlayerOwner(netObject)->physicalPlayerIndex)
 	{
 		return;
 	}
 
 	trace("passing object %016llx (%d) control from %d to %d\n", (uintptr_t)netObject, netObject->objectId, netObject->syncData.ownerId, player->physicalPlayerIndex);
+	TheClones->Log("%s: passing object %016llx (%d) control from %d to %d\n", __func__, (uintptr_t)netObject, netObject->objectId, netObject->syncData.ownerId, player->physicalPlayerIndex);
 
 	ObjectIds_RemoveObjectId(netObject->objectId);
 
-	TheClones->GiveObjectToClient(netObject, g_netIdsByPlayer[player]);
+	netObject->syncData.nextOwnerId = 31;
+	TheClones->SetTargetOwner(netObject, g_netIdsByPlayer[player]);
+
+	fwEntity* entity = (fwEntity*)netObject->GetGameObject();
+	if (entity && entity->IsOfType(HashString("CVehicle")))
+	{
+		CVehicle* vehicle = static_cast<CVehicle*>(entity);
+		VehicleSeatManager* seatManager = vehicle->GetSeatManager();
+
+		for (int i = 0; i < seatManager->GetNumSeats(); i++)
+		{
+			auto occupant = seatManager->GetOccupant(i);
+
+			if (occupant)
+			{
+				auto netOccupant = reinterpret_cast<rage::netObject*>(occupant->GetNetObject());
+
+				if (netOccupant)
+				{
+					if (!netOccupant->syncData.isRemote && netOccupant->objectType != 11)
+					{
+						trace("passing occupant %d control as well\n", netOccupant->objectId);
+
+						PassObjectControlStub(player, netOccupant, a3);
+					}
+				}
+			}
+		}
+	}
 
 	//auto lastIndex = player->physicalPlayerIndex;
 	//player->physicalPlayerIndex = 31;
@@ -448,6 +485,30 @@ static void PassObjectControlStub(CNetGamePlayer* player, rage::netObject* netOb
 	g_origPassObjectControl(player, netObject, a3);
 
 	//player->physicalPlayerIndex = lastIndex;
+}
+
+static void(*g_origSetOwner)(rage::netObject* object, CNetGamePlayer* newOwner);
+
+static void SetOwnerStub(rage::netObject* netObject, CNetGamePlayer* newOwner)
+{
+	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		return g_origSetOwner(netObject, newOwner);
+	}
+
+	g_origSetOwner(netObject, newOwner);
+
+	if (newOwner->physicalPlayerIndex == netObject__GetPlayerOwner(netObject)->physicalPlayerIndex)
+	{
+		return;
+	}
+
+	TheClones->Log("%s: passing object %016llx (%d) ownership from %d to %d\n", __func__, (uintptr_t)netObject, netObject->objectId, netObject->syncData.ownerId, newOwner->physicalPlayerIndex);
+
+	ObjectIds_RemoveObjectId(netObject->objectId);
+
+	netObject->syncData.nextOwnerId = 31;
+	TheClones->SetTargetOwner(netObject, g_netIdsByPlayer[newOwner]);
 }
 
 static bool m158Stub(rage::netObject* object, CNetGamePlayer* player, int type, int* outReason)
@@ -546,6 +607,42 @@ static CNetGamePlayer** GetNetworkPlayerList()
 	return g_playerList;
 }
 
+static int(*g_origGetNetworkPlayerListCount2)();
+static CNetGamePlayer**(*g_origGetNetworkPlayerList2)();
+
+static int GetNetworkPlayerListCount2()
+{
+	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		return g_origGetNetworkPlayerListCount2();
+	}
+
+	return g_playerListCount;
+}
+
+static CNetGamePlayer** GetNetworkPlayerList2()
+{
+	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		return g_origGetNetworkPlayerList2();
+	}
+
+	return g_playerList;
+}
+
+static void netObject__ClearPendingPlayerIndex(rage::netObject* object)
+{
+	if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		if (object->syncData.nextOwnerId == 31 && TheClones->GetPendingClientId(object) != 0xFFFF)
+		{
+			return;
+		}
+	}
+
+	object->syncData.nextOwnerId = -1;
+}
+
 static HookFunction hookFunction([]()
 {
 	// temp dbg
@@ -557,6 +654,7 @@ static HookFunction hookFunction([]()
 
 	MH_Initialize();
 	MH_CreateHook(hook::get_pattern("4C 8B F1 41 BD 05", -0x22), PassObjectControlStub, (void**)&g_origPassObjectControl);
+	MH_CreateHook(hook::get_pattern("8A 41 49 4C 8B F2 48 8B", -0x10), SetOwnerStub, (void**)&g_origSetOwner);
 
 	// return to disable breaking hooks
 	//return;
@@ -577,7 +675,10 @@ static HookFunction hookFunction([]()
 	// 1365
 	MH_CreateHook((void*)0x14107D370, AllocateNetPlayer, (void**)&g_origAllocateNetPlayer);
 
-	MH_CreateHook(hook::get_pattern("8A 41 49 3C FF 74 17 3C 20 73 13 0F B6 C8"), netObject__GetOwnerNetPlayer, (void**)&g_origGetOwnerNetPlayer);
+	MH_CreateHook(hook::get_pattern("8A 41 49 3C FF 74 17 3C 20 73 13 0F B6 C8"), netObject__GetPlayerOwner, (void**)&g_origGetOwnerNetPlayer);
+	MH_CreateHook(hook::get_pattern("8A 41 4A 3C FF 74 17 3C 20 73 13 0F B6 C8"), netObject__GetPendingPlayerOwner, (void**)&g_origGetPendingPlayerOwner);
+
+	hook::jump(hook::get_pattern("C6 41 4A FF C3", 0), netObject__ClearPendingPlayerIndex);
 
 	// replace joining local net player to bubble
 	{
@@ -602,6 +703,12 @@ static HookFunction hookFunction([]()
 		auto location = hook::get_pattern<char>("44 0F 28 CF F3 41 0F 59 C0 F3 44 0F 59 CF F3 44 0F 58 C8 E8", 19);
 		MH_CreateHook(hook::get_call(location + 0), GetNetworkPlayerListCount, (void**)&g_origGetNetworkPlayerListCount);
 		MH_CreateHook(hook::get_call(location + 8), GetNetworkPlayerList, (void**)&g_origGetNetworkPlayerList);
+	}
+
+	{
+		auto location = hook::get_pattern<char>("48 8B F0 85 DB 74 56 8B", -0x34);
+		MH_CreateHook(hook::get_call(location + 0x28), GetNetworkPlayerListCount2, (void**)&g_origGetNetworkPlayerListCount2);
+		MH_CreateHook(hook::get_call(location + 0x2F), GetNetworkPlayerList2, (void**)&g_origGetNetworkPlayerList2);
 	}
 
 	// getnetplayerped 32 cap
@@ -689,25 +796,25 @@ namespace rage
 
 		virtual const char* GetName() = 0;
 
-		virtual bool IsApplicableToPlayer(CNetGamePlayer* player) = 0;
+		virtual bool IsInScope(CNetGamePlayer* player) = 0;
 
-		virtual void m_18() = 0;
+		virtual bool TimeToResend(uint32_t) = 0;
 
-		virtual void m_20() = 0;
+		virtual bool CanChangeScope() = 0;
 
-		virtual void WriteToBuffer(rage::netBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
+		virtual void Prepare(rage::datBitBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
 
-		virtual void ReadFromBuffer(rage::netBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
+		virtual void Handle(rage::datBitBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
 
-		virtual bool Execute(CNetGamePlayer* sourcePlayer, void* connUnk) = 0;
+		virtual bool Decide(CNetGamePlayer* sourcePlayer, void* connUnk) = 0;
 
-		virtual void WriteReply(rage::netBuffer* buffer, CNetGamePlayer* replyPlayer) = 0;
+		virtual void PrepareReply(rage::datBitBuffer* buffer, CNetGamePlayer* replyPlayer) = 0;
 
-		virtual void ApplyReply(rage::netBuffer* buffer, CNetGamePlayer* sourcePlayer) = 0;
+		virtual void HandleReply(rage::datBitBuffer* buffer, CNetGamePlayer* sourcePlayer) = 0;
 
-		virtual void WritePostData(rage::netBuffer* buffer, bool isReply, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
+		virtual void PrepareExtraData(rage::datBitBuffer* buffer, bool isReply, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
 
-		virtual void ApplyPostData(rage::netBuffer* buffer, bool isReply, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
+		virtual void HandleExtraData(rage::datBitBuffer* buffer, bool isReply, CNetGamePlayer* player, CNetGamePlayer* unkPlayer) = 0;
 
 		virtual void m_60() = 0;
 
@@ -774,10 +881,10 @@ static void EventMgr_AddEvent(void* eventMgr, rage::netGameEvent* ev)
 
 	// allocate a RAGE buffer
 	uint8_t packetStub[1024];
-	rage::netBuffer rlBuffer(packetStub, sizeof(packetStub));
+	rage::datBitBuffer rlBuffer(packetStub, sizeof(packetStub));
 
-	ev->WriteToBuffer(&rlBuffer, g_player31, nullptr);
-	ev->WritePostData(&rlBuffer, false, g_player31, nullptr);
+	ev->Prepare(&rlBuffer, g_player31, nullptr);
+	ev->PrepareExtraData(&rlBuffer, false, g_player31, nullptr);
 
 	net::Buffer outBuffer;
 
@@ -795,7 +902,7 @@ static void EventMgr_AddEvent(void* eventMgr, rage::netGameEvent* ev)
 				auto originalIndex = player->physicalPlayerIndex;
 				player->physicalPlayerIndex = 31;
 
-				if (ev->IsApplicableToPlayer(player))
+				if (ev->IsInScope(player))
 				{
 					targetPlayers.insert(g_netIdsByPlayer[player]);
 				}
@@ -883,7 +990,7 @@ static void HandleNetGameEvent(const char* idata, size_t len)
 	std::vector<uint8_t> data(length);
 	buf.Read(data.data(), data.size());
 
-	rage::netBuffer rlBuffer(const_cast<uint8_t*>(data.data()), data.size());
+	rage::datBitBuffer rlBuffer(const_cast<uint8_t*>(data.data()), data.size());
 	rlBuffer.m_f1C = 1;
 
 	if (eventType > 0x5A)
@@ -897,8 +1004,8 @@ static void HandleNetGameEvent(const char* idata, size_t len)
 
 		if (ev)
 		{
-			ev->ApplyReply(&rlBuffer, player);
-			ev->ApplyPostData(&rlBuffer, true, player, g_playerMgr->localPlayer);
+			ev->HandleReply(&rlBuffer, player);
+			ev->HandleExtraData(&rlBuffer, true, player, g_playerMgr->localPlayer);
 
 			delete ev;
 			g_events[eventHeader] = {};
@@ -906,7 +1013,7 @@ static void HandleNetGameEvent(const char* idata, size_t len)
 	}
 	else
 	{
-		using TEventHandlerFn = void(*)(rage::netBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkConn, uint16_t, uint32_t, uint32_t);
+		using TEventHandlerFn = void(*)(rage::datBitBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkConn, uint16_t, uint32_t, uint32_t);
 
 		// for all intents and purposes, the player will be 31
 		auto lastIndex = player->physicalPlayerIndex;
@@ -919,9 +1026,9 @@ static void HandleNetGameEvent(const char* idata, size_t len)
 	}
 }
 
-static void(*g_origExecuteNetGameEvent)(void* eventMgr, rage::netGameEvent* ev, rage::netBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkConn, uint16_t evH, uint32_t, uint32_t);
+static void(*g_origExecuteNetGameEvent)(void* eventMgr, rage::netGameEvent* ev, rage::datBitBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkConn, uint16_t evH, uint32_t, uint32_t);
 
-static void ExecuteNetGameEvent(void* eventMgr, rage::netGameEvent* ev, rage::netBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkConn, uint16_t evH, uint32_t a, uint32_t b)
+static void ExecuteNetGameEvent(void* eventMgr, rage::netGameEvent* ev, rage::datBitBuffer* buffer, CNetGamePlayer* player, CNetGamePlayer* unkConn, uint16_t evH, uint32_t a, uint32_t b)
 {
 	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 	{
@@ -930,20 +1037,20 @@ static void ExecuteNetGameEvent(void* eventMgr, rage::netGameEvent* ev, rage::ne
 
 	//trace("executing a %s\n", ev->GetName());
 
-	ev->ReadFromBuffer(buffer, player, unkConn);
+	ev->Handle(buffer, player, unkConn);
 
 	// missing: some checks
-	if (ev->Execute(player, unkConn))
+	if (ev->Decide(player, unkConn))
 	{
-		ev->ApplyPostData(buffer, false, player, unkConn);
+		ev->HandleExtraData(buffer, false, player, unkConn);
 
 		if (ev->requiresReply)
 		{
 			uint8_t packetStub[1024];
-			rage::netBuffer rlBuffer(packetStub, sizeof(packetStub));
+			rage::datBitBuffer rlBuffer(packetStub, sizeof(packetStub));
 
-			ev->WriteReply(&rlBuffer, player);
-			ev->WritePostData(&rlBuffer, true, player, nullptr);
+			ev->PrepareReply(&rlBuffer, player);
+			ev->PrepareExtraData(&rlBuffer, true, player, nullptr);
 
 			net::Buffer outBuffer;
 			outBuffer.Write<uint8_t>(1);
@@ -994,7 +1101,7 @@ static InitFunction initFunctionEv([]()
 			}
 
 			HandleNetGameEvent(data, len);
-		});
+		}, true);
 	});
 });
 
@@ -1008,6 +1115,18 @@ static bool SendGameEvent(void* eventMgr, void* ev)
 	}
 
 	return 1;
+}
+
+static uint32_t(*g_origGetFireApplicability)(void* event, void* pos);
+
+static uint32_t GetFireApplicability(void* event, void* pos)
+{
+	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		return g_origGetFireApplicability(event, pos);
+	}
+
+	return (0xFFFFFFFF);
 }
 
 static HookFunction hookFunctionEv([]()
@@ -1025,13 +1144,16 @@ static HookFunction hookFunctionEv([]()
 	// can cause crashes due to high player indices, default event sending
 	MH_CreateHook(hook::get_pattern("48 83 EC 30 80 7A 2D FF 4C 8B D2", -0xC), SendGameEvent, (void**)&g_origSendGameEvent);
 
+	// fire applicability
+	MH_CreateHook(hook::get_pattern("85 DB 74 78 44 8B F3 48", -0x30), GetFireApplicability, (void**)&g_origGetFireApplicability);
+
 	MH_EnableHook(MH_ALL_HOOKS);
 });
 
 #include <nutsnbolts.h>
 #include <GameInit.h>
 
-static char(*g_origWriteDataNode)(void* node, uint32_t flags, void* mA0, rage::netObject* object, rage::netBuffer* buffer, int time, void* playerObj, char playerId, void* unk);
+static char(*g_origWriteDataNode)(void* node, uint32_t flags, void* mA0, rage::netObject* object, rage::datBitBuffer* buffer, int time, void* playerObj, char playerId, void* unk);
 
 
 struct VirtualBase
@@ -1064,11 +1186,11 @@ std::string GetType(void* d)
 
 extern rage::netObject* g_curNetObject;
 
-static char(*g_origReadDataNode)(void* node, uint32_t flags, void* mA0, rage::netBuffer* buffer, rage::netObject* object);
+static char(*g_origReadDataNode)(void* node, uint32_t flags, void* mA0, rage::datBitBuffer* buffer, rage::netObject* object);
 
 std::map<int, std::map<void*, std::tuple<int, uint32_t>>> g_netObjectNodeMapping;
 
-static bool ReadDataNodeStub(void* node, uint32_t flags, void* mA0, rage::netBuffer* buffer, rage::netObject* object)
+static bool ReadDataNodeStub(void* node, uint32_t flags, void* mA0, rage::datBitBuffer* buffer, rage::netObject* object)
 {
 	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 	{
@@ -1090,7 +1212,7 @@ static bool ReadDataNodeStub(void* node, uint32_t flags, void* mA0, rage::netBuf
 	}
 }
 
-static bool WriteDataNodeStub(void* node, uint32_t flags, void* mA0, rage::netObject* object, rage::netBuffer* buffer, int time, void* playerObj, char playerId, void* unk)
+static bool WriteDataNodeStub(void* node, uint32_t flags, void* mA0, rage::netObject* object, rage::datBitBuffer* buffer, int time, void* playerObj, char playerId, void* unk)
 {
 	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 	{
@@ -1190,6 +1312,13 @@ public:
 
 	void HandleTimeSync(net::Buffer& buffer);
 
+	bool IsInitialized();
+
+	inline void SetConnectionManager(void* mgr)
+	{
+		m_connectionMgr = mgr;
+	}
+
 private:
 	void* m_vtbl; // 0
 	void* m_connectionMgr; // 8
@@ -1223,6 +1352,33 @@ private:
 
 #include <mmsystem.h>
 
+static hook::cdecl_stub<void*()> _getConnectionManager([]()
+{
+	return hook::get_call(hook::get_pattern("E8 ? ? ? ? C7 44 24 40 60 EA 00 00"));
+});
+
+static bool(*g_origInitializeTime)(netTimeSync* timeSync, void* connectionMgr, int flags, void* trustHost,
+	uint32_t sessionSeed, int* deltaStart, int packetFlags, int initialBackoff, int maxBackoff);
+
+static bool g_initedTimeSync;
+
+bool netTimeSync::IsInitialized()
+{
+	if (!g_initedTimeSync)
+	{
+		g_origInitializeTime(this, _getConnectionManager(), 1, nullptr, 0, nullptr, 7, 2000, 60000);
+
+		// to make the game not try to get time from us
+		m_connectionMgr = nullptr;
+
+		g_initedTimeSync = true;
+
+		return false;
+	}
+
+	return (m_applyFlags & 4) != 0;
+}
+
 void netTimeSync::Update()
 {
 	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
@@ -1230,7 +1386,7 @@ void netTimeSync::Update()
 		return;
 	}
 
-	if (m_connectionMgr && /*m_flags & 2 && */!m_disabled)
+	if (/*m_connectionMgr /*&& m_flags & 2 && */!m_disabled)
 	{
 		uint32_t curTime = timeGetTime();
 
@@ -1331,6 +1487,11 @@ void netTimeSync::HandleTimeSync(net::Buffer& buffer)
 
 static netTimeSync** g_netTimeSync;
 
+bool IsWaitingForTimeSync()
+{
+	return !(*g_netTimeSync)->IsInitialized();
+}
+
 static InitFunction initFunctionTime([]()
 {
 	NetLibrary::OnNetLibraryCreate.Connect([](NetLibrary* lib)
@@ -1343,11 +1504,24 @@ static InitFunction initFunctionTime([]()
 	});
 });
 
+bool netTimeSync__InitializeTimeStub(netTimeSync* timeSync, void* connectionMgr, int flags, void* trustHost,
+	uint32_t sessionSeed, int* deltaStart, int packetFlags, int initialBackoff, int maxBackoff)
+{
+	if (!Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		return g_origInitializeTime(timeSync, connectionMgr, flags, trustHost, sessionSeed, deltaStart, packetFlags, initialBackoff, maxBackoff);
+	}
+
+	timeSync->SetConnectionManager(connectionMgr);
+
+	return true;
+}
+
 static HookFunction hookFunctionTime([]()
 {
-	/*MH_Initialize();
-	
-	MH_EnableHook(MH_ALL_HOOKS);*/
+	MH_Initialize();
+	MH_CreateHook(hook::get_pattern("48 8B D9 48 39 79 08 0F 85 B5 00 00 00", -32), netTimeSync__InitializeTimeStub, (void**)&g_origInitializeTime);
+	MH_EnableHook(MH_ALL_HOOKS);
 
 	g_netTimeSync = hook::get_address<netTimeSync**>(hook::get_pattern("EB 16 48 8B 0D ? ? ? ? 45 33 C9 45 33 C0", 5));
 
@@ -1431,21 +1605,13 @@ static HookFunction hookFunctionWorldGrid([]()
 
 int ObjectToEntity(int objectId)
 {
-	int playerIdx = (objectId >> 16) - 1;
-	int objectIdx = (objectId & 0xFFFF);
-
 	int entityIdx = -1;
+	auto object = TheClones->GetNetObject(objectId & 0xFFFF);
 
-	rage::netObjectMgr::GetInstance()->ForAllNetObjects(playerIdx, [&](rage::netObject* obj)
+	if (object)
 	{
-		char* objectChar = (char*)obj;
-		uint16_t thisObjectId = *(uint16_t*)(objectChar + 10);
-
-		if (objectIdx == thisObjectId)
-		{
-			entityIdx = getScriptGuidForEntity(obj->GetGameObject());
-		}
-	});
+		entityIdx = getScriptGuidForEntity(object->GetGameObject());
+	}
 
 	return entityIdx;
 }
@@ -1502,6 +1668,28 @@ static InitFunction initFunction([]()
 	OnKillNetworkDone.Connect([]()
 	{
 		trackedObjects.clear();
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("NETWORK_GET_ENTITY_OWNER", [](fx::ScriptContext& context)
+	{
+		fwEntity* entity = (fwEntity*)getScriptEntity(context.GetArgument<int>(0));
+		
+		if (!entity)
+		{
+			context.SetResult<int>(-1);
+			return;
+		}
+
+		rage::netObject* netObj = (rage::netObject*)entity->GetNetObject();
+
+		if (!netObj)
+		{
+			context.SetResult<int>(-1);
+			return;
+		}
+
+		auto owner = netObject__GetPlayerOwner(netObj);
+		context.SetResult<int>(owner->physicalPlayerIndex);
 	});
 #if 0
 	fx::ScriptEngine::RegisterNativeHandler("EXPERIMENTAL_SAVE_CLONE_CREATE", [](fx::ScriptContext& context)
@@ -1638,7 +1826,7 @@ static InitFunction initFunction([]()
 		}
 
 		st->ApplyToObject(obj, nullptr);
-		rage::netObjectMgr::GetInstance()->RegisterObject(obj);
+		rage::netObjectMgr::GetInstance()->RegisterNetworkObject(obj);
 
 		netBlender_SetTimestamp(obj->GetBlender(), g_queryFunctions->GetTimestamp());
 
@@ -1760,7 +1948,7 @@ static InitFunction initFunction([]()
 		}
 
 		st->ApplyToObject(obj, nullptr);
-		rage::netObjectMgr::GetInstance()->RegisterObject(obj);
+		rage::netObjectMgr::GetInstance()->RegisterNetworkObject(obj);
 
 		netBlender_SetTimestamp(obj->GetBlender(), g_queryFunctions->GetTimestamp());
 

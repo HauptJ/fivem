@@ -102,7 +102,7 @@ void SteamComponent::Initialize()
 	// launch the presence dummy dummy if needed
 	static HostSharedData<CfxState> hostData("CfxInitState");
 
-	if (hostData->IsMasterProcess())
+	if (hostData->IsMasterProcess() || hostData->IsGameProcess())
 	{
 		SetEnvironmentVariable(L"SteamAppId", L"218");
 
@@ -448,7 +448,7 @@ bool SteamComponent::RunPresenceDummy()
 		trace("game parent PID: %d\n", parentPid);
 
 		// open a handle to the parent process with SYNCHRONIZE rights
-		HANDLE processHandle = OpenProcess(SYNCHRONIZE, FALSE, parentPid);
+		HANDLE processHandle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
 
 		// mark us as needing to exit
 		exitProcess = true;

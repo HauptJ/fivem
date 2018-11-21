@@ -1,3 +1,6 @@
+-- to work around slow init times due to packagesrv.com being down
+http = nil
+
 xpcall(function()
 newoption {
 	trigger     = "builddir",
@@ -157,7 +160,7 @@ end
 
 require 'vstudio'
 
-premake.override(premake.vstudio.cs2005, 'debugProps', function(base, cfg)
+premake.override(premake.vstudio.dotnetbase, 'debugProps', function(base, cfg)
 	if cfg.symbols == premake.ON then
 		_p(2,'<DebugSymbols>true</DebugSymbols>')
 	end
@@ -169,9 +172,11 @@ local function WriteDocumentationFileXml(_premake, _prj, value)
     _premake.w('<DocumentationFile>' .. string.gsub(_prj.buildtarget.relpath, ".dll", ".xml") .. '</DocumentationFile>')
 end
 
-premake.override(premake.vstudio.cs2005, "compilerProps", function(base, prj)
+premake.override(premake.vstudio.dotnetbase, "compilerProps", function(base, prj)
     base(prj)
     WriteDocumentationFileXml(premake, prj, XmlDocFileName)
+
+    premake.w('<GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>')
 end)
 
 	project "CitiMono"
@@ -181,6 +186,8 @@ end)
 
 		-- Missing XML comment for publicly visible type or member
 		disablewarnings 'CS1591'
+		
+		dotnetframework '4.6'
 
 		clr 'Unsafe'
 
@@ -194,7 +201,7 @@ end)
 
 		links { "System.dll", "Microsoft.CSharp.dll", "System.Core.dll", "../data/client/citizen/clr2/lib/mono/4.5/MsgPack.dll" }
 
-		buildoptions '/debug:portable'
+		buildoptions '/debug:portable /langversion:7.1'
 
 		configuration "Debug*"
 			targetdir (binroot .. '/debug/citizen/clr2/lib/mono/4.5/')

@@ -22,6 +22,8 @@
 
 static ILauncherInterface* g_launcher;
 
+void InitializeMiniDumpOverride();
+
 #if defined(PAYNE)
 BYTE g_gmfOrig[5];
 BYTE g_gmfOrigW[5];
@@ -266,7 +268,7 @@ extern std::map<std::string, std::string> g_redirectionData;
 
 static std::wstring MapRedirectedFilename(const wchar_t* lpFileName)
 {
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
+	static std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 
 	// original filename with backslashes converted to slashes
 	std::wstring origFileName = lpFileName;
@@ -376,9 +378,14 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 		return;
 	}
 
+	// force loading _this_ variant
+	LoadLibrary(MakeRelativeCitPath(L"scripthookv.dll").c_str());
+
 	CoreSetDebuggerPresent();
 
     SetCoreMapping();
+
+	InitializeMiniDumpOverride();
 
 	// get the launcher interface
 	GetLauncherInterface_t getLauncherInterface = (GetLauncherInterface_t)GetProcAddress(gameLibrary, "GetLauncherInterface");
@@ -404,7 +411,7 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 	static HostSharedData<CfxState> initState("CfxInitState");
 
 	// prevent accidental duplicate instances
-	if (isMainGame && !initState->IsMasterProcess())
+	if (isMainGame && !initState->IsMasterProcess() && !initState->IsGameProcess())
 	{
 		return;
 	}

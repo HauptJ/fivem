@@ -73,7 +73,9 @@ namespace fx
 	{
 		g_gameServer = this;
 
-		seCreateContext(&m_seContext);
+		// TODO: re-enable this when we actually figure out threading
+		//seCreateContext(&m_seContext);
+		m_seContext = seGetCurrentContext();
 
 		m_seContext->MakeCurrent();
 		m_seContext->AddAccessControlEntry(se::Principal{ "system.console" }, se::Object{ "command" }, se::AccessType::Allow);
@@ -154,6 +156,11 @@ namespace fx
 			nng_listener listener;
 			nng_listen(netSocket, "inproc://netlib_client", &listener, NNG_FLAG_NONBLOCK);
 
+			auto lastTime = msec().count();
+
+			uint64_t residualTime = 0;
+			auto frameTime = 1000 / 50;
+
 			while (true)
 			{
 				// service enet with our remaining waits
@@ -188,6 +195,33 @@ namespace fx
 				for (auto& host : this->hosts)
 				{
 					this->ProcessHost(host.get());
+				}
+
+				{
+					auto now = msec().count() - lastTime;
+
+					if (now >= 150)
+					{
+						trace("hitch warning: net frame time of %d milliseconds\n", now);
+					}
+
+					// clamp time to 200ms to reduce effects of excessive hitches
+					if (now > 200)
+					{
+						now = 200;
+					}
+
+					residualTime += now;
+
+					lastTime = msec().count();
+
+					// intervals
+					while (residualTime > frameTime)
+					{
+						residualTime -= frameTime;
+
+						OnNetworkTick();
+					}
 				}
 
 				{
@@ -241,7 +275,7 @@ namespace fx
 
 	void GameServer::InternalSendPacket(int peer, int channel, const net::Buffer& buffer, ENetPacketFlag flags)
 	{
-		auto packet = enet_packet_create(buffer.GetBuffer(), buffer.GetLength(), flags);
+		auto packet = enet_packet_create(buffer.GetBuffer(), buffer.GetCurOffset(), flags);
 		enet_peer_send(m_peerHandles.left.find(peer)->get_right(), channel, packet);
 	}
 
@@ -870,11 +904,7 @@ namespace fx
 				{
 					if (targetNetId == 0xFFFF)
 					{
-						// TODO: make this run on the net thread
-						gscomms_execute_callback_on_main_thread([=]()
-						{
-							instance->GetComponent<fx::ServerGameState>()->ParseGameStatePacket(client, packetData);
-						});
+						instance->GetComponent<fx::ServerGameState>()->ParseGameStatePacket(client, packetData);
 
 						return;
 					}

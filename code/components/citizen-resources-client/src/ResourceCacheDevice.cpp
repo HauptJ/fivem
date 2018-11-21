@@ -27,13 +27,15 @@ namespace fx
 
 #include <Error.h>
 
-static concurrency::concurrent_unordered_set<std::string> g_downloadingSet;
-static concurrency::concurrent_unordered_set<std::string> g_downloadedSet;
+static concurrency::concurrent_unordered_map<uint32_t, bool> g_downloadingSet;
+static concurrency::concurrent_unordered_set<uint32_t> g_downloadedSet;
 
 static concurrency::concurrent_unordered_map<std::string, std::shared_ptr<ResourceCacheDevice::FileData>> g_fileDataSet;
 
-inline std::shared_ptr<ResourceCacheDevice::FileData> GetFileDataForEntry(const std::string& refHash)
+inline std::shared_ptr<ResourceCacheDevice::FileData> GetFileDataForEntry(const ResourceCacheEntryList::Entry& entry)
 {
+	auto refHash = (entry.referenceHash.empty()) ? entry.remoteUrl : entry.referenceHash;
+
 	auto it = g_fileDataSet.find(refHash);
 
 	if (it == g_fileDataSet.end())
@@ -106,11 +108,11 @@ ResourceCacheDevice::THandle ResourceCacheDevice::OpenInternal(const std::string
 	// is this a bulk handle?
 	handleData->bulkHandle = (bulkPtr != nullptr);
 	handleData->entry = entry.get();
-	handleData->fileData = GetFileDataForEntry(entry->referenceHash);
+	handleData->fileData = GetFileDataForEntry(*entry);
 	handleData->fileData->status = FileData::StatusNotFetched;
 
 	// open the file beforehand if it's in the cache
-	auto cacheEntry = m_cache->GetEntryFor(entry->referenceHash);
+	auto cacheEntry = m_cache->GetEntryFor(*entry);
 	
 	if (cacheEntry.is_initialized())
 	{
@@ -150,18 +152,13 @@ ResourceCacheDevice::THandle ResourceCacheDevice::OpenInternal(const std::string
 							AddCrashometry("rcd_invalid_resource", "true");
 
 							handleData->fileData->status = FileData::StatusNotFetched;
+
+							// close the file so we can refetch it
+							handleData->parentDevice->CloseBulk(handleData->parentHandle);
 						}
 					}
 				}
 			}
-		}
-	}
-
-	if (handleData->fileData->status != FileData::StatusFetched)
-	{
-		if (g_downloadedSet.find(handleData->entry.referenceHash) != g_downloadedSet.end())
-		{
-			trace("Huh - we fetched %s already, and it isn't in the cache now. That's strange.\n", handleData->entry.basename);
 		}
 	}
 
@@ -244,19 +241,21 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 	}
 
 	// file extension for cache stuff
-	std::string extension = handleData->entry.basename.substr(handleData->entry.basename.find_last_of('.') + 1);
-	std::string outFileName = m_cachePath + extension + "_" + handleData->entry.referenceHash;
+	auto remoteHash = HashRageString((handleData->entry.referenceHash.empty()) ? handleData->entry.remoteUrl.c_str() : handleData->entry.referenceHash.c_str());
 
-	auto openFile = [=]()
+	std::string extension = handleData->entry.basename.substr(handleData->entry.basename.find_last_of('.') + 1);
+	std::string outFileName = fmt::sprintf("%s/unconfirmed/%s_%08x", m_cachePath, extension, remoteHash);
+
+	auto openFile = [this, handleData](const ResourceCache::Entry& entry)
 	{
 		// open the file as desired
-		handleData->parentDevice = vfs::GetDevice(outFileName);
+		handleData->parentDevice = vfs::GetDevice(entry.GetLocalPath());
 
 		if (handleData->parentDevice.GetRef())
 		{
 			handleData->parentHandle = (handleData->bulkHandle) ?
-				handleData->parentDevice->OpenBulk(outFileName, &handleData->bulkPtr) :
-				handleData->parentDevice->Open(outFileName, true);
+				handleData->parentDevice->OpenBulk(entry.GetLocalPath(), &handleData->bulkPtr) :
+				handleData->parentDevice->Open(entry.GetLocalPath(), true);
 		}
 
 		MarkFetched(handleData);
@@ -272,7 +271,7 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 
 			if (handleData->fileData->status == FileData::StatusFetched && (handleData->parentDevice.GetRef() == nullptr || handleData->parentHandle == INVALID_DEVICE_HANDLE))
 			{
-				openFile();
+				openFile(*m_cache->GetEntryFor(handleData->entry));
 
 				return true;
 			}
@@ -286,15 +285,18 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 	ResetEvent(handleData->fileData->eventHandle);
 	handleData->fileData->status = FileData::StatusFetching;
 
-	if (g_downloadingSet.find(handleData->entry.referenceHash) == g_downloadingSet.end())
+	if (auto it = g_downloadingSet.find(remoteHash); (it == g_downloadingSet.end() || !it->second))
 	{
 		// mark this hash as downloading (to prevent multiple concurrent downloads)
-		g_downloadingSet.insert(handleData->entry.referenceHash);
+		g_downloadingSet.insert({ remoteHash, true });
 
 		// log the request starting
 		uint32_t initTime = timeGetTime();
 
-		trace(__FUNCTION__ " downloading %s (hash %s) from %s\n", handleData->entry.basename.c_str(), handleData->entry.referenceHash.c_str(), handleData->entry.remoteUrl.c_str());
+		trace(__FUNCTION__ " downloading %s (hash %s) from %s\n",
+			handleData->entry.basename.c_str(),
+			handleData->entry.referenceHash.empty() ? "[direct]" : handleData->entry.referenceHash.c_str(),
+			handleData->entry.remoteUrl.c_str());
 
 		HttpRequestOptions options;
 		options.progressCallback = [this, handleData](const ProgressInfo& info)
@@ -368,12 +370,7 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 				// log success
 				trace("ResourceCacheDevice: downloaded %s in %d msec (size %d)\n", entryRef.basename.c_str(), (timeGetTime() - initTime), outSize);
 
-				if (g_downloadedSet.find(entryRef.referenceHash) != g_downloadedSet.end())
-				{
-					trace("Downloaded the same asset (%s) twice in the same run - that's bad.\n", entryRef.basename);
-				}
-
-				g_downloadedSet.insert(entryRef.referenceHash);
+				g_downloadedSet.insert(remoteHash);
 
 				std::unique_lock<std::mutex> lock(fileDataRef->fetchLock);
 
@@ -390,7 +387,16 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 
 				if (!m_blocking && handleData->fileData == fileDataRef)
 				{
-					openFile();
+					auto entry = m_cache->GetEntryFor(entryRef);
+
+					if (entry)
+					{
+						openFile(*entry);
+					}
+					else
+					{
+						FatalError("Failed to write valid entry for ResourceCacheDevice file %s", entryRef.remoteUrl);
+					}
 				}
 
 				fileDataRef->status = FileData::StatusFetched;
@@ -403,6 +409,9 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 
 			// unblock the mutex
 			SetEvent(fileDataRef->eventHandle);
+
+			// allow downloading this file again
+			g_downloadingSet[remoteHash] = false;
 		});
 	}
 
@@ -418,7 +427,7 @@ bool ResourceCacheDevice::EnsureFetched(HandleData* handleData)
 
 	if (handleData->fileData->status == FileData::StatusFetched && (handleData->parentDevice.GetRef() == nullptr || handleData->parentHandle == INVALID_DEVICE_HANDLE))
 	{
-		openFile();
+		openFile(*m_cache->GetEntryFor(handleData->entry));
 	}
 
 	return (handleData->fileData->status == FileData::StatusFetched);
@@ -667,7 +676,7 @@ bool ResourceCacheDevice::ExtensionCtl(int controlIdx, void* controlData, size_t
 
 		if (entry)
 		{
-			auto fileData = GetFileDataForEntry(entry->referenceHash);
+			auto fileData = GetFileDataForEntry(*entry);
 
 			data->outData = fmt::sprintf("RSC version: %d\nRSC page flags: virt %08x/phys %08x\nResource name: %s\nReference hash: %s\n", 
 				atoi(entry->extData["rscVersion"].c_str()),
@@ -678,9 +687,11 @@ bool ResourceCacheDevice::ExtensionCtl(int controlIdx, void* controlData, size_t
 
 			if (fileData)
 			{
+				auto remoteHash = HashRageString((entry->referenceHash.empty()) ? entry->remoteUrl.c_str() : entry->referenceHash.c_str());
+
 				data->outData += fmt::sprintf("Status: %s\nDownloaded now: %s\nRSC header: %02x %02x %02x %02x\n\n",
 					StatusToString(fileData->status),
-					(g_downloadedSet.find(entry->referenceHash) != g_downloadedSet.end()) ? "Yes" : "No", 
+					(g_downloadedSet.find(remoteHash) != g_downloadedSet.end()) ? "Yes" : "No", 
 					fileData->rscHeader[0], fileData->rscHeader[1], fileData->rscHeader[2], fileData->rscHeader[3]);
 			}
 
@@ -708,8 +719,12 @@ void ResourceCacheEntryList::AttachToObject(fx::Resource* resource)
 	m_parentResource = resource;
 }
 
+void MountKvpDevice();
+
 void MountResourceCacheDevice(std::shared_ptr<ResourceCache> cache)
 {
 	vfs::Mount(new ResourceCacheDevice(cache, true), "cache:/");
 	vfs::Mount(new ResourceCacheDevice(cache, false), "cache_nb:/");
+
+	MountKvpDevice();
 }
